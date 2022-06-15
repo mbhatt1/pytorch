@@ -8,10 +8,14 @@ import random
 dequantize = TensorAPoT.dequantize
 
 class TestQuantizedTensor(unittest.TestCase):
-    def test_quantize_APoT(self):
-        t = torch.Tensor()
-        with self.assertRaises(NotImplementedError):
-            TensorAPoT.quantize_APoT(t)
+    """ Tests quantize_apot result on simple 1-dim tensor
+        and hardcoded values for b and k
+        * tensor2quantize: torch.tensor([0, 1])
+        * b: 4
+        * k: 2
+    """
+    def test_quantize_APoT_1d(self):
+        t = TensorAPoT()
 
     """ Tests quantize_apot result on random 1-dim tensor
         and hardcoded values for b, k
@@ -29,7 +33,7 @@ class TestQuantizedTensor(unittest.TestCase):
 
         tensor2dequantize = tensor2dequantize.int()
 
-        orig_input = tensor2dequantize.clone()
+        orig_input = tensor2quantize.clone()
 
         max_val = torch.max(orig_input)
 
@@ -50,8 +54,8 @@ class TestQuantizedTensor(unittest.TestCase):
         expected_result = True
 
         for ele, res in zipped_result:
-            idx = list(level_indices).index(ele)
-            if res != quantized_levels[idx]:
+            idx = list(quantized_levels).index(ele)
+            if res != level_indices[idx]:
                 expected_result = False
 
         self.assertTrue(expected_result)
