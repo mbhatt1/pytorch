@@ -21,7 +21,10 @@ from .utils import (
 from ..utils import _parent_name
 from ..qconfig import QConfigAny
 from ..quantization_mappings import get_quantized_operator
-from .utils import create_node_from_old_node_preserve_meta
+from .utils import (
+    create_node_from_old_node_preserve_meta,
+    get_all_args_as_positional_args,
+)
 from typing import Dict, Tuple, Type, List, Callable, Any, Union, Set, Optional
 import operator
 
@@ -32,6 +35,7 @@ QOP_TO_ARG_NAMES_TO_SKIP = {
     torch._ops.ops.quantized.instance_norm:
     ['running_mean', 'running_var', 'use_input_stats', 'momentum'],
 }
+
 
 def _is_node_in_list(node, modules, func_list, method_list, module_type_list):
     is_call_function = node.op == "call_function" and node.target in func_list
@@ -187,7 +191,7 @@ def is_dequantize_node(node):
 def is_getattr_tensor_metadata_node(node):
     return node.op == "call_function" and \
         node.target == getattr and \
-        node.args[1] in ["shape"]
+        get_all_args_as_positional_args(node)[1] in ["shape"]
 
 def should_skip_lowering(op: torch.fx.node.Node, qconfig_map: Dict[str, QConfigAny]):
     """
@@ -369,7 +373,7 @@ def fold_weight(
             env[node.name] = folded_graph.create_node(
                 'get_attr', packed_weight_name, (), {})
         elif prepack_node is not None:
-            # remove the foled node
+            # remove the folded node
             continue
         else:
             # copy other nodes
@@ -418,14 +422,14 @@ def _match_static_pattern(
     if node.op != "call_function" or node.target != torch.quantize_per_tensor:
         return SKIP_LOWERING_VALUE
     q_node = node
-    ref_node = q_node.args[0]
+    ref_node = get_all_args_as_positional_args(q_node)[0]
     assert(isinstance(ref_node, Node))
 
     # Handle cases where the node is wrapped in a ReLU
     if (ref_node.op == "call_function" and ref_node.target in (F.relu, torch.relu)) or\
             (ref_node.op == "call_module" and type(_get_module(ref_node, modules)) == nn.ReLU):
         relu_node = ref_node
-        ref_node = relu_node.args[0]
+        ref_node = get_all_args_as_positional_args(relu_node)[0]
         assert(isinstance(ref_node, Node))
     else:
         relu_node = None
@@ -445,11 +449,12 @@ def _match_static_pattern(
     # Match dequantize node(s). Both of the following conditions must pass:
     # (1) All `torch.fx.Node`s at the matching indices must be a dequantize node
     # (2) There must be at least one dequantize node
+    all_pos_args = get_all_args_as_positional_args(ref_node)
     matched_dequantize = False
     for i in dequantize_node_arg_indices:
-        assert i < len(ref_node.args),\
-            "Dequantize index %s exceeded reference node's arg length %s" % (i, len(ref_node.args))
-        arg = ref_node.args[i]
+        assert i < len(all_pos_args),\
+            "Dequantize index %s exceeded reference node's arg length %s" % (i, len(get_all_args_as_positional_args(ref_node)))
+        arg = all_pos_args[i]
         if is_dequantize_node(arg):
             matched_dequantize = True
         elif isinstance(arg, Node):
@@ -476,7 +481,8 @@ def _lower_static_weighted_ref_module(
         if q_node is None:
             continue
         assert(ref_node is not None)
-        (_, scale_node, zero_point_node, _) = q_node.args
+        all_q_node_args = get_all_args_as_positional_args(q_node)
+        (_, scale_node, zero_point_node, _) = all_q_node_args
         ref_module = _get_module(ref_node, modules)
         ref_class = type(ref_module)
         assert(isinstance(scale_node, Node))
@@ -500,9 +506,11 @@ def _lower_static_weighted_ref_module(
         setattr(modules[parent_name], module_name, q_module)
 
         # Step 2: Remove dq_node, q_node and its args
-        dq_node = ref_node.args[0]
+        all_ref_node_args = get_all_args_as_positional_args(ref_node)
+        dq_node = all_ref_node_args[0]
         assert(isinstance(dq_node, Node))
-        dq_node.replace_all_uses_with(dq_node.args[0])
+        all_dq_node_args = get_all_args_as_positional_args(dq_node)
+        dq_node.replace_all_uses_with(all_dq_node_args[0])
         model.graph.erase_node(dq_node)
         q_node.replace_all_uses_with(ref_node)
         model.graph.erase_node(q_node)
@@ -522,7 +530,9 @@ def _lower_dynamic_weighted_ref_module(model: QuantizedGraphModule):
                set(DYNAMIC_LOWER_FUSED_MODULE_MAP.keys())):
             continue
         ref_node = n
-        dq_node = ref_node.args[0]
+        all_ref_node_args = get_all_args_as_positional_args(ref_node)
+        dq_node = all_ref_node_args[0]
+        assert isinstance(dq_node, Node)
         if dq_node.op != "call_method" or dq_node.target != "dequantize":
             continue
         # don't support lowering the pattern when the result of dequantize is used by
@@ -530,7 +540,10 @@ def _lower_dynamic_weighted_ref_module(model: QuantizedGraphModule):
         if len(dq_node.users) > 1:
             continue
 
-        input_dynamic_q_node = dq_node.args[0]
+        all_dq_node_args = get_all_args_as_positional_args(dq_node)
+        input_dynamic_q_node = all_dq_node_args[0]
+        if not isinstance(input_dynamic_q_node, Node):
+            continue
         # don't support lowering the pattern when the result of quantize is used by
         # multiple nodes
         if len(input_dynamic_q_node.users) > 1:
@@ -540,7 +553,8 @@ def _lower_dynamic_weighted_ref_module(model: QuantizedGraphModule):
            input_dynamic_q_node.target != torch.quantize_per_tensor_dynamic:
             continue
 
-        activation_compute_dtype = input_dynamic_q_node.args[1]
+        all_input_dynamic_q_node_args = get_all_args_as_positional_args(input_dynamic_q_node)
+        activation_compute_dtype = all_input_dynamic_q_node_args[1]
         is_fp16 = activation_compute_dtype == torch.float16
         is_int8 = activation_compute_dtype in [torch.quint8, torch.qint8]
         if not is_int8 and not is_fp16:
@@ -564,7 +578,7 @@ def _lower_dynamic_weighted_ref_module(model: QuantizedGraphModule):
         # remove q - dq node
         dq_node.replace_all_uses_with(input_dynamic_q_node)
         model.graph.erase_node(dq_node)
-        input_dynamic_q_node.replace_all_uses_with(input_dynamic_q_node.args[0])
+        input_dynamic_q_node.replace_all_uses_with(get_all_args_as_positional_args(input_dynamic_q_node)[0])
         model.graph.erase_node(input_dynamic_q_node)
 
 def _lower_weight_only_weighted_ref_module(model: QuantizedGraphModule):
@@ -608,13 +622,16 @@ def _lower_static_weighted_ref_functional(
         if q_node is None:
             continue
         assert(func_node is not None)
-        (_, output_scale_node, output_zp_node, _) = q_node.args
-        (input_dq_node, weight_dq_node, *remaining_func_args) = func_node.args
+        q_node_all_args = get_all_args_as_positional_args(q_node)
+        (_, output_scale_node, output_zp_node, _) = q_node_all_args
+        func_node_all_pos_args = get_all_args_as_positional_args(func_node)
+        (input_dq_node, weight_dq_node, *remaining_func_args) = func_node_all_pos_args
         assert(isinstance(output_zp_node, Node))
-        assert(isinstance(input_dq_node, Node))
-        assert(isinstance(weight_dq_node, Node))
-        quantized_weight = weight_dq_node.args[0]
-        assert(isinstance(quantized_weight, Node))
+        assert isinstance(input_dq_node, Node)
+        assert isinstance(weight_dq_node, Node)
+        all_weight_dq_node_args = get_all_args_as_positional_args(weight_dq_node)
+        quantized_weight = all_weight_dq_node_args[0]
+        assert isinstance(quantized_weight, Node)
         if quantized_weight.op != "call_function" or\
                 quantized_weight.target not in (torch.quantize_per_tensor, torch.quantize_per_channel):
             continue
@@ -625,7 +642,8 @@ def _lower_static_weighted_ref_functional(
         # Conv prepack args: (quantized weights[, bias, stride, padding, dilation, groups])
         prepack_args = [quantized_weight] + remaining_func_args
         if func_node.target == F.linear:
-            weight_dtype = quantized_weight.args[-1]
+            all_quantized_weight_args = get_all_args_as_positional_args(quantized_weight)
+            weight_dtype = all_quantized_weight_args[-1]
             prepack_op = get_linear_prepack_op_for_dtype(weight_dtype)
         elif func_node.target in CONV_FUNCTIONAL_OPS:
             prepack_op = get_qconv_prepack_op(func_node.target)  # type: ignore[arg-type]
@@ -643,14 +661,17 @@ def _lower_static_weighted_ref_functional(
         # Step 2: Replace reference pattern with the corresponding quantized op
         (q_func, q_relu_func) = STATIC_LOWER_FUNCTIONAL_MAP[func_node.target]  # type: ignore[index]
         func_node.target = q_relu_func if relu_node is not None else q_func
-        func_node.args = (input_dq_node.args[0], packed_weight, output_scale_node, output_zp_node)
+        all_input_dq_node_args = get_all_args_as_positional_args(input_dq_node)
+        func_node.args = (all_input_dq_node_args[0], packed_weight, output_scale_node, output_zp_node)
+        func_node.kwargs = {}
         q_node.replace_all_uses_with(func_node)
         # Move func_node after output_zp_node in the graph
         output_zp_node.append(func_node)
 
         # Clean up: Remove dequantize and quantize nodes, and the relu node if it exists
         for dqn in [input_dq_node, weight_dq_node]:
-            dqn_input = dqn.args[0]
+            all_dqn_args = get_all_args_as_positional_args(dqn)
+            dqn_input = all_dqn_args[0]
             dqn.replace_all_uses_with(dqn_input)
             model.graph.erase_node(dqn)
         model.graph.erase_node(q_node)
@@ -683,7 +704,7 @@ def _lower_dynamic_weighted_ref_functional(
            func_node.op == "call_module" and \
            type(modules[str(func_node.target)]) == torch.nn.ReLU:
             relu_node = func_node
-            func_node = relu_node.args[0]
+            func_node = get_all_args_as_positional_args(relu_node)[0]
         else:
             relu_node = None
         if should_skip_lowering(func_node, qconfig_map):
@@ -692,12 +713,16 @@ def _lower_dynamic_weighted_ref_functional(
         # Conv args: (dequantized inputs, dequantized weights[, bias, stride, padding, dilation, groups])
         if func_node.op != "call_function" or func_node.target not in DYNAMIC_LOWER_FUNCTIONAL_MAP:
             continue
-        (input_dq_node, weight_dq_node, *remaining_func_args) = func_node.args
+        (input_dq_node, weight_dq_node, *remaining_func_args) = get_all_args_as_positional_args(func_node)
+        if not isinstance(input_dq_node, Node) or not isinstance(weight_dq_node, Node):
+            continue
         if input_dq_node.op != "call_method" or input_dq_node.target != "dequantize" or \
            weight_dq_node.op != "call_method" or weight_dq_node.target != "dequantize":
             continue
 
-        input_dynamic_q_node = input_dq_node.args[0]
+        input_dynamic_q_node = get_all_args_as_positional_args(input_dq_node)[0]
+        if not isinstance(input_dynamic_q_node, Node):
+            continue
         # don't support lowering the pattern when the result of quantize is used by
         # multiple nodes
         if len(input_dynamic_q_node.users) > 1:
@@ -708,14 +733,20 @@ def _lower_dynamic_weighted_ref_functional(
             continue
 
         reduce_range_node = None
-        (pattern_input, activation_compute_dtype, reduce_range_node) = input_dynamic_q_node.args
+        (pattern_input, activation_compute_dtype, reduce_range_node) = get_all_args_as_positional_args(input_dynamic_q_node)
+        if not isinstance(activation_compute_dtype, torch.dtype):
+            continue
         is_fp16 = activation_compute_dtype == torch.float16
         is_int8 = activation_compute_dtype in [torch.quint8, torch.qint8]
         if not is_int8 and not is_fp16:
             continue
 
-        quantized_weight = weight_dq_node.args[0]
-        weight_dtype = quantized_weight.args[-1]
+        quantized_weight = get_all_args_as_positional_args(weight_dq_node)[0]
+        if not isinstance(quantized_weight, Node):
+            continue
+        weight_dtype = get_all_args_as_positional_args(quantized_weight)[-1]
+        if not isinstance(weight_dtype, torch.dtype):
+            continue
 
         # Step 1: Try to select reference pattern with the corresponding quantized op
         dynamic_quant_dtype_key = (activation_compute_dtype, weight_dtype)
@@ -756,15 +787,17 @@ def _lower_dynamic_weighted_ref_functional(
             func_node.args = (pattern_input, packed_weight, reduce_range_node)
         else:
             func_node.args = (pattern_input, packed_weight)
+        func_node.kwargs = {}
 
         if relu_node is not None:
             relu_node.replace_all_uses_with(func_node)
 
         # Step 4: Remove dequantize and quantize nodes, and the relu node if it exists
         for dqn in [input_dq_node, weight_dq_node]:
-            dqn_input = dqn.args[0]
+            dqn_input = get_all_args_as_positional_args(dqn)[0]
             dqn.replace_all_uses_with(dqn_input)
             model.graph.erase_node(dqn)
+        input_dynamic_q_node.replace_all_uses_with(get_all_args_as_positional_args(input_dynamic_q_node)[0])
         model.graph.erase_node(input_dynamic_q_node)
         if relu_node is not None:
             model.graph.erase_node(relu_node)
@@ -781,16 +814,16 @@ def _lower_quantized_binary_op(
         if q_node is None:
             continue
         assert(bop_node is not None)
-        (_, scale_node, zero_point_node, _) = q_node.args
+        (_, scale_node, zero_point_node, _) = get_all_args_as_positional_args(q_node)
 
         # Step 1: Remove dequant nodes
         num_dq_nodes = 0
-        for arg in bop_node.args:
+        for arg in get_all_args_as_positional_args(bop_node):
             if not is_dequantize_node(arg):
                 continue
             dq_node = arg
             assert(isinstance(dq_node, Node))
-            dn_input = dq_node.args[0]
+            dn_input = get_all_args_as_positional_args(dq_node)[0]
             dq_node.replace_all_uses_with(dn_input)
             model.graph.erase_node(dq_node)
             num_dq_nodes += 1
@@ -802,7 +835,7 @@ def _lower_quantized_binary_op(
         qbin_op = binop_to_qbinop[bop_node.target]
         # prepare the args for quantized bianry op
         # (x, y)
-        qop_node_args = list(bop_node.args)
+        qop_node_args = get_all_args_as_positional_args(bop_node)
         # (x, y, scale, zero_point)
         # add scale and zero_point arguments for Tensor - Tensor operation
         if num_dq_nodes == 2:
@@ -827,10 +860,10 @@ def special_pattern_replacement(model: QuantizedGraphModule):
         q_node = n
         is_quantize = q_node.target == torch.quantize_per_tensor
         is_to_fp16 = q_node.op == "call_method" and q_node.target == "to" and \
-            len(q_node.args) == 2 and q_node.args[1] == torch.float16
+            len(get_all_args_as_positional_args(q_node)) == 2 and get_all_args_as_positional_args(q_node)[1] == torch.float16
         if not (is_quantize or is_to_fp16):
             continue
-        ref_node = q_node.args[0]
+        ref_node = get_all_args_as_positional_args(q_node)[0]
         # get output scale/zero_point/dtype from the quantize node
         # ref_node, scale_node, zero_point_node, dtype = q_node.args
         # TODO: add safety checks that users for the ref_node and dq_node needs to be one
@@ -851,7 +884,9 @@ def special_pattern_replacement(model: QuantizedGraphModule):
         is_call_function, is_call_method, is_call_module = is_special_pattern_node(ref_node, modules)
         if not (is_call_module or is_call_function or is_call_method):
             continue
-        dq_node_or_nodes = ref_node.args[0]
+        if not isinstance(ref_node, Node):
+            continue
+        dq_node_or_nodes = get_all_args_as_positional_args(ref_node)[0]
         assert isinstance(dq_node_or_nodes, Node) or isinstance(dq_node_or_nodes, (tuple, list))
         is_dequantize = False
         if isinstance(dq_node_or_nodes, Node):
@@ -870,8 +905,13 @@ def special_pattern_replacement(model: QuantizedGraphModule):
             ref_module = modules[ref_node.target]
             if type(ref_module) in SPECIAL_PATTERN_LOWER_MODULE_MAP and is_quantize:
                 qmodule_cls = SPECIAL_PATTERN_LOWER_MODULE_MAP.get(type(ref_module))
-                scale_node = q_node.args[1]
-                zero_point_node = q_node.args[2]
+                if not isinstance(q_node, Node):
+                    continue
+                all_q_node_args = get_all_args_as_positional_args(q_node)
+                scale_node = all_q_node_args[1]
+                zero_point_node = all_q_node_args[2]
+                if not isinstance(scale_node, Node) or not isinstance(zero_point_node, Node):
+                    continue
                 output_scale = getattr(model, scale_node.target)
                 output_zero_point = getattr(model, zero_point_node.target)
 
@@ -888,14 +928,15 @@ def special_pattern_replacement(model: QuantizedGraphModule):
             dq_nodes = list(dq_node_or_nodes)
 
         for dq_node in dq_nodes:
-            dn_input = dq_node.args[0]
+            dn_input = get_all_args_as_positional_args(dq_node)[0]
             dq_node.replace_all_uses_with(dn_input)
             model.graph.erase_node(dq_node)
 
         # store q node args
-        qnode_qparams = list(q_node.args)[1:]
+        all_q_node_args = get_all_args_as_positional_args(q_node)
+        qnode_qparams = list(all_q_node_args)[1:]
         # replace uses of q node with input and remove q node
-        q_node_input = q_node.args[0]
+        q_node_input = all_q_node_args[0]
         q_node.replace_all_uses_with(q_node_input)
         model.graph.erase_node(q_node)
 
@@ -905,15 +946,22 @@ def special_pattern_replacement(model: QuantizedGraphModule):
             # insert an op after the zero_point node so that the scale/zero_point
             # nodes are is available
             qop = get_quantized_operator(ref_node.target)
-            args = list(ref_node.args)
+            args = ref_node.args
+            assert len(args) == 0, "Need to add normalization for node: " + str(ref_node.target)
             kwargs = dict(ref_node.kwargs)
             if qop in QOP_TO_ARG_NAMES_TO_SKIP:
-                args_to_skip = QOP_TO_ARG_NAMES_TO_SKIP[qop]
-                for arg in args_to_skip:
-                    if arg in kwargs:
-                        kwargs.pop(arg)
+                arg_names_to_skip = QOP_TO_ARG_NAMES_TO_SKIP[qop]
+                for arg_name in arg_names_to_skip:
+                    kwargs.pop(arg_name)
             kwargs["output_scale"] = qnode_qparams[0]
             kwargs["output_zero_point"] = qnode_qparams[1]
+
+            if qop == torch.ops.quantized.elu:
+                if "scale" not in kwargs:
+                    kwargs["scale"] = 1
+                if "input_scale" not in kwargs:
+                    kwargs["input_scale"] = 1
+
             with model.graph.inserting_after(qnode_qparams[1]):
                 qop_node = create_node_from_old_node_preserve_meta(
                     model.graph,
@@ -929,19 +977,25 @@ def special_pattern_replacement(model: QuantizedGraphModule):
 
     return model
 
-def _lower_getattr_tensor_metadta_op(model: QuantizedGraphModule):
+def _lower_getattr_tensor_metadata_op(model: QuantizedGraphModule):
     """ Modified the graph of the model inplace, to skip extra dequantize op before
     the general tensor shape ops when possible
     """
     for n in model.graph.nodes:
         if is_getattr_tensor_metadata_node(n):
-            maybe_dq = n.args[0]
+            all_n_args = get_all_args_as_positional_args(n)
+            maybe_dq = all_n_args[0]
+            if not isinstance(maybe_dq, Node):
+                continue
             if maybe_dq.op != "call_method" or maybe_dq.target != "dequantize":
                 continue
             # skip the dequantize node
-            args = list(n.args)
-            args[0] = n.args[0].args[0]
+            args = list(all_n_args)
+            if not isinstance(all_n_args[0], Node):
+                continue
+            args[0] = get_all_args_as_positional_args(all_n_args[0])[0]
             n.args = tuple(args)
+            n.kwargs = {}
 
 def _lower_to_native_backend(
     model: QuantizedGraphModule,
@@ -958,7 +1012,7 @@ def _lower_to_native_backend(
     _lower_static_weighted_ref_functional(model, qconfig_map)
     _lower_dynamic_weighted_ref_functional(model, qconfig_map)
     _lower_quantized_binary_op(model, qconfig_map)
-    _lower_getattr_tensor_metadta_op(model)
+    _lower_getattr_tensor_metadata_op(model)
     special_pattern_replacement(model)
     model = fold_weight(model, node_name_to_scope)
     model.graph.eliminate_dead_code()
